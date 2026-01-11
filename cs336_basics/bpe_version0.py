@@ -2,11 +2,11 @@ from collections import Counter
 from dataclasses import dataclass
 from collections import defaultdict
 import os
-from typing import Any, BinaryIO, Tuple, Set, List, DefaultDict
+from typing import Any, BinaryIO, Tuple, Set, List, DefaultDict, Iterable
 import regex as re
 from logging import Logger
 import logging
-
+import json 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -26,6 +26,51 @@ class PreToken:
 TokenPair = Tuple[Token, Token]
 PairCounts = Counter[TokenPair]
 ReverseIndex = DefaultDict[TokenPair, Set[int]]
+
+def fmt_token(t: Token) -> str:
+    b = t.value
+    try:
+        s = b.decode("utf-8")
+        # Show spaces/newlines clearly
+        return repr(s)
+    except UnicodeDecodeError:
+        return f"0x{b.hex()}"
+
+def fmt_pair(p: TokenPair) -> str:
+    return f"({fmt_token(p[0])},{fmt_token(p[1])})"
+
+def fmt_tokens(tokens: List[Token], limit: int = 60) -> str:
+    parts = [fmt_token(t) for t in tokens[:limit]]
+    suffix = " ..." if len(tokens) > limit else ""
+    return "[" + " ".join(parts) + "]" + suffix
+
+def log_counter_top_pairs(counts: "PairCounts", k: int = 12, *, title: str = "top pairs") -> None:
+    top = counts.most_common(k)
+    msg = ", ".join(f"{fmt_pair(pair)}={cnt}" for pair, cnt in top)
+    log.info("%s: %s (unique_pairs=%d)", title, msg, len(counts))
+
+
+def log_reverse_hit(reverse_index: "ReverseIndex", pair: "TokenPair", k: int = 10) -> None:
+    idxs = reverse_index.get(pair, set())
+    sample = sorted(list(idxs))[:k]
+    log.info("affected for %s: n=%d sample=%s", fmt_pair(pair), len(idxs), sample)
+
+
+def log_pretokens_sample(pre_tokens: list["PreToken"], n: int = 8) -> None:
+    log.info("pretokens: n=%d (showing %d)", len(pre_tokens), min(n, len(pre_tokens)))
+    for i, pt in list(enumerate(pre_tokens))[:n]:
+        log.info("  PT[%d] count=%d raw=%r tokens=%s", i, pt.count, pt.raw, fmt_tokens(pt.tokens))
+
+def log_vocab_tail(vocab: list[bytes], k: int = 10) -> None:
+    tail = vocab[-k:]
+    pretty = []
+    for b in tail:
+        try:
+            pretty.append(repr(b.decode("utf-8")))
+        except UnicodeDecodeError:
+            pretty.append(f"0x{b.hex()}")
+    log.info("vocab size=%d tail=%s", len(vocab), pretty)
+
 
 def process_pre_tokens(pre_tokens: List[PreToken]) -> tuple[PairCounts, ReverseIndex]:
     """
@@ -199,6 +244,7 @@ def get_pretoken_corpus_counts(documents: list[str]) -> List[PreToken]:
     for document in documents:
         counter += pretokenize_document(document)
     
+    log.info(f"Counter: {counter}")
     pretokens: List[PreToken] = []
     for k, v in counter.items():
         b = k.encode("utf-8")
@@ -239,36 +285,40 @@ def get_documents(corpus_filename: str, num_processes: int, split_special_token:
         return documents
     
 def bpe_version_0(documents: list[str], end_of_text: bytes, num_merges: int):
-    vocabulary = [end_of_text] + [bytes([i]) for i in range(256)]
-    
-    # Corpus is split based on special tokens.
+    vocabulary: list[bytes] = [end_of_text] + [bytes([i]) for i in range(256)]
+
     pretoken_counts: List[PreToken] = get_pretoken_corpus_counts(documents)
-    log.info(f"Pretoken counts: {pretoken_counts}")
+    log_pretokens_sample(pretoken_counts, n=10)
+
     token_pair_counts, reverse_index = process_pre_tokens(pretoken_counts)
-    log.info(f"Token pair counts: {token_pair_counts}")
-    log.info(f"Reverse index: {reverse_index}")
-    
-    rules = []
+    log_counter_top_pairs(token_pair_counts, k=12, title="initial")
+
+    rules: list[TokenPair] = []
     for i in range(num_merges):
-        max_count_token_pair = get_max_count_token_pair(token_pair_counts)
-        log.info(f"Max count token pair {i}: {max_count_token_pair}")
-        rules.append(max_count_token_pair)
-        token_pair_counts, reverse_index = combine_tokens(max_count_token_pair, token_pair_counts, reverse_index)
-        log.info(f"Token pair counts {i}: {token_pair_counts}")
-        log.info(f"Reverse index {i}: {reverse_index}")
-        vocabulary.append(max_count_token_pair[0].tokens + max_count_token_pair[1].tokens)
-        log.info(f"Vocabulary {i}: {vocabulary}")
-    
+        pair = get_max_count_token_pair(token_pair_counts)
+        cnt = token_pair_counts.get(pair, 0)
+        log.info("merge %d: pick %s count=%d", i, fmt_pair(pair), cnt)
+        log_reverse_hit(reverse_index, pair)
+
+        rules.append(pair)
+
+        token_pair_counts, reverse_index = combine_tokens(
+            pretoken_counts, pair, token_pair_counts, reverse_index
+        )
+
+        log_counter_top_pairs(token_pair_counts, k=12, title=f"after merge {i}")
+        vocabulary.append(pair[0].value + pair[1].value)
+        log_vocab_tail(vocabulary, k=8)
+
+    log.info("learned merges: %s", [fmt_pair(p) for p in rules])
     return rules, vocabulary
 
 
 if __name__ == "__main__":
-    bpe_corpus = """low low low low low
-    lower lower widest widest
-    newest newest newest newest newest newest"""
+    bpe_corpus = """low low low low low lower lower widest widest newest newest newest newest newest newest"""
 
     end_of_text = "<|endoftext|>"
     num_merges = 6
-    rules, vocabulary = bpe_version_0(bpe_corpus, end_of_text, num_merges)
+    rules, vocabulary = bpe_version_0([bpe_corpus], end_of_text, num_merges)
     print(rules)
     print(vocabulary)
